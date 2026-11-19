@@ -176,7 +176,14 @@ cdef class LuaRuntime:
       code as ``python.builtins.*``?  Note that this does not prevent access
       to the globals available as special Python function attributes, for
       example.  Use an ``attribute_filter`` function for that.
-      (default: True, new in Lupa 1.2)
+      The builtins include functions like ``eval()``, ``exec()`` and
+      ``__import__()`` that allow arbitrary code execution, and functions like
+      ``getattr()`` and ``setattr()`` that bypass an ``attribute_filter`` or
+      ``attribute_handlers``, so they must only be made available to trusted
+      Lua code.
+      See https://github.com/scoder/lupa/security/advisories/GHSA-69v7-xpr6-6gjm
+      (default: False, new in Lupa 1.2; the default was True before the fix
+      for GHSA-69v7-xpr6-6gjm)
 
     * ``unpack_returned_tuples``: should Python tuples be unpacked in Lua?
       If ``py_fun()`` returns ``(1, 2, 3)``, then does ``a, b, c = py_fun()``
@@ -213,7 +220,7 @@ cdef class LuaRuntime:
     def __cinit__(self, encoding='UTF-8', source_encoding=None,
                   attribute_filter=None, attribute_handlers=None,
                   bint register_eval=True, bint unpack_returned_tuples=False,
-                  bint register_builtins=True):
+                  bint register_builtins=False):
         cdef lua_State* L = lua.luaL_newstate()
         if L is NULL:
             raise LuaError("Failed to initialise Lua runtime")

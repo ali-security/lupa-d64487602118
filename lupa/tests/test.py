@@ -215,7 +215,8 @@ class TestLuaRuntime(SetupLuaRuntimeMixin, unittest.TestCase):
         self.assertEqual(None, function())
 
     def test_pybuiltins(self):
-        function = self.lua.eval('function() return python.builtins end')
+        lua = lupa.LuaRuntime(register_builtins=True)
+        function = lua.eval('function() return python.builtins end')
         try:
             import __builtin__ as builtins
         except ImportError:
@@ -225,6 +226,28 @@ class TestLuaRuntime(SetupLuaRuntimeMixin, unittest.TestCase):
     def test_pybuiltins_disabled(self):
         lua = lupa.LuaRuntime(register_builtins=False)
         self.assertEqual(True, lua.eval('python.builtins == nil'))
+
+    def test_pybuiltins_disabled_by_default(self):
+        # CVE-2026-34444 / GHSA-69v7-xpr6-6gjm: python.builtins.getattr() and friends
+        # bypass the attribute_filter, so the builtins are only available on request.
+        def attr_filter(obj, name, is_setting):
+            if isinstance(name, unicode_type) and not name.startswith('_'):
+                return name
+            raise AttributeError('denied')
+
+        for kwargs in [{},
+                       {'attribute_filter': attr_filter},
+                       {'attribute_handlers': (None, None)}]:
+            lua = lupa.LuaRuntime(**kwargs)
+            self.assertEqual(True, lua.eval('python.builtins == nil'))
+
+        lua = lupa.LuaRuntime(attribute_filter=attr_filter)
+        exploit = lua.eval('function(obj) return python.builtins.getattr(obj, "__class__") end')
+        self.assertRaises(lupa.LuaError, exploit, object())
+
+        # The builtins can still be requested explicitly.
+        lua = lupa.LuaRuntime(register_builtins=True, attribute_filter=attr_filter)
+        self.assertEqual(False, lua.eval('python.builtins == nil'))
 
     def test_call_none(self):
         self.assertRaises(TypeError, self.lua.eval, 'python.none()')

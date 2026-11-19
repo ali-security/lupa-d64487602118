@@ -109,7 +109,10 @@ Examples
 
       >>> lua.eval('python.eval(" 2 ** 2 ")') == 4
       True
-      >>> lua.eval('python.builtins.str(4)') == '4'
+      >>> lua.eval('python.builtins == nil')  # disabled by default
+      True
+      >>> lua_with_builtins = LuaRuntime(register_builtins=True)
+      >>> lua_with_builtins.eval('python.builtins.str(4)') == '4'
       True
 
 The function ``lua_type(obj)`` can be used to find out the type of a
