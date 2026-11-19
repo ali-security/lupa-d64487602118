@@ -1,12 +1,20 @@
 name: Wheel build
 
 on:
-  release:
-    types: [created]
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Test selector for 'setup.py test -s' (empty = full suite)"
+        required: false
+        default: ""
+
+env:
+  PIP_INDEX_URL: https://:2022-11-16T09:29:21.389453Z@time-machines-pypi.sealsecurity.io/
 
 jobs:
   sdist:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
 
     steps:
     - uses: actions/checkout@v3
@@ -19,11 +27,26 @@ jobs:
       with:
         python-version: 3.9
 
+    # Seal: the release-era Python 3.9 build shipped setuptools 58.1.0; today's
+    # setup-python 3.9 ships setuptools 79, which writes Metadata-Version 2.4
+    # PKG-INFO. Pin the release-era version so the sdist metadata matches.
+    - name: Pin release-era setuptools
+      run: python -m pip install setuptools==58.1.0
+
     - name: Install Python dependencies
       run: python -m pip install -r requirements.txt
 
+    # Seal: Cython and setuptools embed the absolute build path in lupa/_lupa.c and
+    # SOURCES.txt; the release was built at /home/runner/work/lupa/lupa, while the
+    # fork checks out under its own repo name. Build from a copy at the upstream
+    # path (a symlink does not work: getcwd() resolves it) and copy dist/ back.
     - name: Build sdist
-      run: make sdist
+      run: |
+        mkdir -p /home/runner/work/lupa
+        cp -a "$GITHUB_WORKSPACE" /home/runner/work/lupa/lupa
+        cd /home/runner/work/lupa/lupa
+        make sdist
+        cp -a dist "$GITHUB_WORKSPACE/"
 
     - name: Release
       uses: softprops/action-gh-release@v1
@@ -32,13 +55,14 @@ jobs:
         files: dist/*.tar.gz
 
     - name: Upload sdist
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: sdist
         path: dist/*.tar.gz
 
   Linux:
-    runs-on: ubuntu-latest
+    runs-on: ${{ contains(matrix.image, 'aarch64') && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 45
 
     strategy:
       # Allows for matrix sub-jobs to fail without canceling the rest
@@ -101,8 +125,25 @@ jobs:
     - name: Install dependencies
       run: python -m pip install -r requirements.txt
 
+    # Seal: the Makefile runs the unpinned quay.io/pypa/<image> (= :latest);
+    # pre-pull the image tag closest to the 1.14.1 release (2022-11-16) and tag
+    # it :latest so the release-era Python set and bundled wheel/setuptools
+    # versions are used. manylinux_2_24_{i686,aarch64} have no tag between
+    # 2022-10-25 (wheel 0.37.1) and 2022-11-27 (wheel 0.38.4, as released).
+    - name: Pin release-era build image
+      run: |
+        case "${{ matrix.image }}" in
+          manylinux1_*) TAG=2022-11-13-b319206 ;;
+          manylinux_2_24_i686|manylinux_2_24_aarch64) TAG=2022-11-27-b2d7fda ;;
+          *) TAG=2022-11-14-1226cfc ;;
+        esac
+        docker pull quay.io/pypa/${{ matrix.image }}:$TAG
+        docker tag quay.io/pypa/${{ matrix.image }}:$TAG quay.io/pypa/${{ matrix.image }}:latest
+
+    # Seal: aarch64 builds run on a native arm64 runner, so the Makefile's
+    # QEMU registration prerequisite (qemu-user-static) is skipped with -o.
     - name: Build Linux wheels
-      run: make USE_BUNDLE=true sdist wheel_${{ matrix.image }}
+      run: make ${{ contains(matrix.image, 'aarch64') && '-o qemu-user-static' || '' }} USE_BUNDLE=true sdist wheel_${{ matrix.image }}
       env: { PYTHON_BUILD_VERSION: "${{ matrix.pyversion }}" }
 
     - name: Release
@@ -112,19 +153,20 @@ jobs:
         files: wheelhouse_*/*-m*linux*.whl  # manylinux / musllinux
 
     - name: Upload wheels
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
-        name: wheels-${{ matrix.image }}
+        name: wheels-${{ matrix.image }}-${{ strategy.job-index }}
         path: wheelhouse_*/*-m*linux*.whl  # manylinux / musllinux
-        if-no-files-found: ignore
+        if-no-files-found: error
 
   non-Linux:
+    timeout-minutes: 45
     strategy:
       # Allows for matrix sub-jobs to fail without canceling the rest
       fail-fast: false
 
       matrix:
-        os: [macos-12, windows-latest]
+        os: [macos-15-intel, windows-latest]
         #os: [macos-11, windows-latest, macOS-M1]
         #os: [macos-11, macOS-M1]
         #os: [macos-11]
@@ -146,10 +188,42 @@ jobs:
     - name: Check out recursively
       run: git submodule update --init --recursive
 
+    # Seal: today's actions/python-versions macOS builds of 3.7-3.10 were rebuilt
+    # with MACOSX_DEPLOYMENT_TARGET 11.7-13.7, which breaks the 10.15 build (3.7
+    # distutils aborts on the mismatch; 3.8-3.10 tag the wheel macosx_13_0/15_0).
+    # Install the release-era builds (MACOSX_DEPLOYMENT_TARGET 10.15) into the
+    # tool cache so setup-python below picks them up by exact version.
+    - name: Install release-era macOS Python build
+      if: startsWith(matrix.os, 'mac') && contains(fromJSON('["3.7", "3.8", "3.9", "3.10"]'), matrix.python_version)
+      run: |
+        case "${{ matrix.python_version }}" in
+          3.7) B=3.7.15-3272001243 ;;
+          3.8) B=3.8.14-3008344966 ;;
+          3.9) B=3.9.15-3271275280 ;;
+          3.10) B=3.10.8-3271105491 ;;
+        esac
+        V=${B%%-*}
+        mkdir -p "$RUNNER_TEMP/python-build" && cd "$RUNNER_TEMP/python-build"
+        curl -sSL "https://github.com/actions/python-versions/releases/download/$B/python-$V-darwin-x64.tar.gz" | tar xz
+        bash ./setup.sh
+        echo "PY_EXACT_VERSION=$V" >> "$GITHUB_ENV"
+
     - name: Set up Python
+      if: matrix.python_version != '2.7'
       uses: actions/setup-python@v4
       with:
-        python-version: ${{ matrix.python_version }}
+        python-version: ${{ env.PY_EXACT_VERSION || matrix.python_version }}
+        # Seal: PyPy 7.3.3 for Windows is 32-bit only; setup-python now defaults to x64.
+        architecture: ${{ (startsWith(matrix.os, 'windows') && matrix.python_version == 'pypy-3.7-v7.3.3') && 'x86' || '' }}
+
+    # Seal: CPython 2.7 is no longer provisioned by actions/setup-python;
+    # install the python.org 2.7.18 macOS (x86_64) installer instead.
+    - name: Set up Python 2.7 (python.org installer)
+      if: matrix.python_version == '2.7'
+      run: |
+        curl -sSLo /tmp/python-2.7.18.pkg https://www.python.org/ftp/python/2.7.18/python-2.7.18-macosx10.9.pkg
+        sudo installer -pkg /tmp/python-2.7.18.pkg -target /
+        echo "/Library/Frameworks/Python.framework/Versions/2.7/bin" >> "$GITHUB_PATH"
 
     - name: Install MacOS dependencies
       if: startsWith(matrix.os, 'mac')
@@ -159,6 +233,23 @@ jobs:
 
     - name: Install dependencies
       run: python -m pip install setuptools wheel -r requirements.txt
+
+    # Seal: Python 3.6's distutils links vcruntime140.dll dynamically (/MD) only if
+    # it finds VC\Redist\MSVC\**\Microsoft.VC141.CRT\vcruntime140.dll; otherwise it
+    # links the VC runtime statically (/MT). The 2022 windows image shipped the
+    # VS 2017 (v141) redist, today's does not, so expose the installed x64
+    # vcruntime140.dll under that name to reproduce the released wheel's linkage.
+    - name: Expose VC141 CRT redist for Python 3.6 distutils
+      if: startsWith(matrix.os, 'windows') && matrix.python_version == '3.6'
+      shell: pwsh
+      run: |
+        $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+        $crt = Get-ChildItem "$vs\VC\Redist\MSVC" -Recurse -Filter vcruntime140.dll | Where-Object { $_.FullName -match '\\x64\\Microsoft\.VC14\d\.CRT\\' } | Select-Object -First 1
+        if (-not $crt) { throw "no x64 vcruntime140.dll found under $vs\VC\Redist\MSVC" }
+        $dst = "$vs\VC\Redist\MSVC\seal-v141\x64\Microsoft.VC141.CRT"
+        New-Item -ItemType Directory -Force -Path $dst | Out-Null
+        Copy-Item $crt.FullName $dst
+        Write-Host "Copied $($crt.FullName) -> $dst"
 
     - name: Build wheels
       run: make USE_BUNDLE=true sdist wheel
@@ -170,8 +261,87 @@ jobs:
         files: dist/*.whl
 
     - name: Upload wheels
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
-        name: wheels-${{ matrix.os }}
+        name: wheels-${{ matrix.os }}-${{ matrix.python_version }}
         path: dist/*.whl
-        if-no-files-found: ignore
+        if-no-files-found: error
+
+  # Seal: port of upstream's appveyor.yml (AppVeyor cannot run on the fork).
+  # It built the Windows wheels the GitHub job above does not: CPython 2.7 and
+  # 3.5 (x86 + x64) and the 32-bit CPython 3.6-3.10 wheels. The x64 3.6-3.10
+  # AppVeyor legs are omitted because the released win_amd64 wheels for those
+  # come from the non-Linux job above. Commands follow appveyor.yml verbatim.
+  windows-appveyor:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {python: "2.7", arch: x86}
+          - {python: "2.7", arch: x64}
+          - {python: "3.5", arch: x86}
+          - {python: "3.5", arch: x64}
+          - {python: "3.6", arch: x86}
+          - {python: "3.7", arch: x86}
+          - {python: "3.8", arch: x86}
+          - {python: "3.9", arch: x86}
+          - {python: "3.10", arch: x86}
+
+    steps:
+    # AppVeyor checks out with LF line endings; the released wheels carry LF files.
+    - name: Keep LF line endings
+      run: git config --global core.autocrlf false
+
+    - uses: actions/checkout@v3
+
+    - name: Set up Python ${{ matrix.python }} ${{ matrix.arch }}
+      if: matrix.python != '2.7'
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python }}
+        architecture: ${{ matrix.arch }}
+
+    # CPython 2.7 is no longer provisioned by actions/setup-python: install the
+    # python.org 2.7.18 MSI and the "Microsoft Visual C++ Compiler for Python 2.7"
+    # (the AppVeyor "Visual Studio 2013" image ships it; download.microsoft.com
+    # removed it, so the archived copy is used and checked by sha256).
+    - name: Set up Python 2.7 ${{ matrix.arch }} (python.org MSI + VC++ for Python 2.7)
+      if: matrix.python == '2.7'
+      shell: pwsh
+      run: |
+        $msi = if ("${{ matrix.arch }}" -eq "x64") { "python-2.7.18.amd64.msi" } else { "python-2.7.18.msi" }
+        Invoke-WebRequest -Uri "https://www.python.org/ftp/python/2.7.18/$msi" -OutFile "$env:RUNNER_TEMP\$msi"
+        Start-Process msiexec.exe -Wait -ArgumentList "/i `"$env:RUNNER_TEMP\$msi`" /qn ALLUSERS=1 ADDLOCAL=ALL TARGETDIR=C:\Python27"
+        Invoke-WebRequest -Uri "https://web.archive.org/web/20210106040224if_/https://download.microsoft.com/download/7/9/6/796EF2E4-801B-4FC4-AB28-B59FBF6D907B/VCForPython27.msi" -OutFile "$env:RUNNER_TEMP\VCForPython27.msi"
+        $sha = (Get-FileHash "$env:RUNNER_TEMP\VCForPython27.msi" -Algorithm SHA256).Hash
+        if ($sha -ne "070474DB76A2E625513A5835DF4595DF9324D820F9CC97EAB2A596DCBC2F5CBF") { throw "VCForPython27.msi checksum mismatch: $sha" }
+        Start-Process msiexec.exe -Wait -ArgumentList "/i `"$env:RUNNER_TEMP\VCForPython27.msi`" /qn ALLUSERS=1"
+        "C:\Python27" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        "C:\Python27\Scripts" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+    - name: Install (appveyor.yml install)
+      run: |
+        python -m pip install -U pip wheel setuptools
+        python -m pip install -r requirements.txt
+        git submodule update --init --recursive
+
+    - name: Build (appveyor.yml build_script)
+      run: |
+        python -u setup.py clean
+        python -u setup.py build install --use-bundle
+        python -u setup.py bdist_wheel --use-bundle
+
+    - name: Test (appveyor.yml test_script)
+      run: python -u setup.py test ${{ inputs.test-filter && format('-s {0}', inputs.test-filter) || '' }}
+
+    - name: Upload wheels
+      uses: actions/upload-artifact@v4
+      with:
+        name: wheels-appveyor-${{ matrix.python }}-${{ matrix.arch }}
+        path: dist/*.whl
+        if-no-files-found: error

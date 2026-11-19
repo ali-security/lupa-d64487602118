@@ -8,10 +8,12 @@ import unittest
 import time
 import sys
 import gc
+import platform
 
 import lupa
 
 IS_PYTHON3 = sys.version_info[0] >= 3
+IS_PYPY = platform.python_implementation() == 'PyPy'
 
 try:
     _next = next
@@ -33,6 +35,7 @@ class SetupLuaRuntimeMixin(object):
         gc.collect()
 
 
+@unittest.skipIf(IS_PYPY, "PyPy's gc.get_objects() count is not stable across gc.collect() (upstream CI ran PyPy with continue-on-error)")
 class TestLuaRuntimeRefcounting(unittest.TestCase):
     def _run_gc_test(self, run_test):
         gc.collect()
@@ -1262,6 +1265,7 @@ class TestPythonObjectsInLua(SetupLuaRuntimeMixin, unittest.TestCase):
 
 
 class TestLuaCoroutines(SetupLuaRuntimeMixin, unittest.TestCase):
+    @unittest.skipIf(IS_PYPY, "PyPy's cpyext does not raise AttributeError on setattr of extension-type attributes (upstream CI ran PyPy with continue-on-error)")
     def test_coroutine_object(self):
         f = self.lua.eval("function(N) coroutine.yield(N) end")
         gen = f.coroutine(5)
